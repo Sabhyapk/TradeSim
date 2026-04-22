@@ -29,11 +29,12 @@ EXCHANGE_SUFFIX = {
     "US":  "",
 }
 
+# FIX: Replaced BSE numeric codes with named tickers that yfinance supports
 POPULAR_SYMBOLS = {
     "NSE": ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
             "HINDUNILVR", "SBIN", "BAJFINANCE", "WIPRO", "ADANIENT"],
-    "BSE": ["500325", "532540", "500209", "500180", "532174",
-            "500696", "500112", "500034", "507685", "512599"],
+    "BSE": ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
+            "HINDUNILVR", "SBIN", "BAJFINANCE", "WIPRO", "ADANIENT"],
     "US":  ["AAPL", "TSLA", "MSFT", "GOOGL", "AMZN",
             "META", "NVDA", "BTC-USD", "ETH-USD", "SPY"],
 }
@@ -44,6 +45,7 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -91,6 +93,12 @@ def fetch_current_price(symbol: str, exchange: str) -> float:
     ticker = build_ticker(symbol, exchange)
     t = yf.Ticker(ticker)
     hist = t.history(period="2d")
+
+    if hist.empty and exchange.upper() == "BSE":
+        fallback = f"{symbol.upper()}.NS"
+        t = yf.Ticker(fallback)
+        hist = t.history(period="2d")
+
     if hist.empty:
         raise HTTPException(status_code=404, detail=f"No data for {ticker}")
     return float(hist["Close"].iloc[-1])
@@ -102,6 +110,12 @@ def get_chart(exchange: str, symbol: str, period: str = "6mo"):
     ticker = build_ticker(symbol, exchange)
     t = yf.Ticker(ticker)
     hist = t.history(period=period)
+
+    # FIX: Fallback to NSE if BSE returns empty
+    if hist.empty and exchange.upper() == "BSE":
+        ticker = f"{symbol.upper()}.NS"
+        hist = yf.Ticker(ticker).history(period=period)
+
     if hist.empty:
         raise HTTPException(status_code=404, detail=f"No data for {ticker}")
 
@@ -139,6 +153,7 @@ def get_price(exchange: str, symbol: str):
     return {"symbol": symbol, "exchange": exchange, "price": price}
 
 
+# FIX: Removed duplicate broken route that called non-existent fetch_symbols_for_exchange()
 @app.get("/api/symbols/{exchange}")
 def get_symbols(exchange: str):
     syms = POPULAR_SYMBOLS.get(exchange.upper(), [])
@@ -167,20 +182,20 @@ def get_wallet():
         pos_value = cur_price * pos["qty"]
         total_position_value += pos_value
         holdings.append({
-            "symbol":       sym,
-            "exchange":     exc,
-            "qty":          pos["qty"],
-            "avg_entry":    round(avg_entry, 4),
-            "current_price":round(cur_price, 4),
+            "symbol":        sym,
+            "exchange":      exc,
+            "qty":           pos["qty"],
+            "avg_entry":     round(avg_entry, 4),
+            "current_price": round(cur_price, 4),
             "position_value":round(pos_value, 4),
             "unrealized_pl": round(unreal_pl, 4),
         })
     conn.close()
     cash = wallet["cash"]
     return {
-        "cash":        round(cash, 2),
-        "equity":      round(cash + total_position_value, 2),
-        "holdings":    holdings,
+        "cash":     round(cash, 2),
+        "equity":   round(cash + total_position_value, 2),
+        "holdings": holdings,
     }
 
 
