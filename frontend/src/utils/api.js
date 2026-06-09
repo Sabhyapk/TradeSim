@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 const api = axios.create({
-  baseURL: 'https://tradesim-backend-1b74.onrender.com',
+  baseURL: 'https://tradesim-backend-1b74.onrender.com/api',
   withCredentials: true
 })
 
