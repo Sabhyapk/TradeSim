@@ -7,6 +7,8 @@ import sqlite3
 import secrets
 import hashlib
 import re
+import os
+import requests
 from datetime import datetime
 from typing import Optional
 
@@ -14,13 +16,14 @@ app = FastAPI(title="TradeSim API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://trade-sim-tau.vercel.app",],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 DB_PATH         = "tradesim.db"
+YF_CACHE_DIR    = os.path.join(os.path.dirname(__file__), "yfinance_cache")
 INITIAL_BALANCE = 10000.0
 SLIPPAGE        = 0.0005   # 0.05%
 SESSION_DAYS    = 7
@@ -37,18 +40,21 @@ POPULAR_SYMBOLS = {
             "META","NVDA","BTC-USD","ETH-USD","SPY"],
 }
 
-# Intraday intervals use fixed 7-day window (yfinance free tier limit)
+# Intraday intervals use a short window to stay inside Yahoo Finance limits.
 INTRADAY = {"1m", "5m", "10m", "1h"}
+MAX_CHART_DAYS = 100
+MAX_INTRADAY_DAYS = 7
 
  
 
 INTERVAL_PERIOD_MAP = {
-    "1d":  "6mo",
-    "1mo": "2y",
-    "3mo": "5y",
-    "6mo": "5y",
-    "1y":  "10y",
+    "1d":  f"{MAX_CHART_DAYS}d",
+    "1mo": f"{MAX_CHART_DAYS}d",
+    "3mo": f"{MAX_CHART_DAYS}d",
 }
+
+os.makedirs(YF_CACHE_DIR, exist_ok=True)
+yf.set_tz_cache_location(YF_CACHE_DIR)
 
 # ── Password helpers ───────────────────────────────────────────────────
 def hash_password(password: str) -> str:
@@ -151,11 +157,85 @@ def get_current_user(session_token: Optional[str] = Cookie(default=None)) -> int
 def build_ticker(symbol: str, exchange: str) -> str:
     return f"{symbol.upper()}{EXCHANGE_SUFFIX.get(exchange.upper(), '')}"
 
+def normalize_chart_period(period: str, intraday: bool) -> str:
+    match = re.fullmatch(r"(\d+)d", (period or "").strip().lower())
+    requested_days = int(match.group(1)) if match else MAX_CHART_DAYS
+    max_days = MAX_INTRADAY_DAYS if intraday else MAX_CHART_DAYS
+    return f"{max(1, min(requested_days, max_days))}d"
+
+def yahoo_chart_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    yahoo_interval = "60m" if interval == "1h" else interval
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    response = requests.get(
+        url,
+        params={
+            "range": period,
+            "interval": yahoo_interval,
+            "includePrePost": "false",
+            "events": "div,splits",
+        },
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()["chart"]["result"]
+    if not payload:
+        return pd.DataFrame()
+
+    result = payload[0]
+    timestamps = result.get("timestamp") or []
+    quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+    if not timestamps or not quote:
+        return pd.DataFrame()
+
+    tz = result.get("meta", {}).get("exchangeTimezoneName")
+    date_index = pd.to_datetime(timestamps, unit="s", utc=True)
+    if tz:
+        date_index = date_index.tz_convert(tz)
+
+    hist = pd.DataFrame({
+        "Open": quote.get("open"),
+        "High": quote.get("high"),
+        "Low": quote.get("low"),
+        "Close": quote.get("close"),
+        "Volume": quote.get("volume"),
+    }, index=date_index)
+    hist.index.name = "Datetime" if interval in INTRADAY or interval in {"2m", "5m", "15m", "30m", "60m", "90m", "1h", "4h"} else "Date"
+    return hist.dropna(subset=["Open", "High", "Low", "Close"])
+
+def fetch_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    try:
+        hist = yahoo_chart_history(ticker, period, interval)
+        if not hist.empty:
+            return hist
+    except Exception:
+        pass
+    return yf.Ticker(ticker).history(period=period, interval=interval)
+
 def fetch_current_price(symbol: str, exchange: str) -> float:
     ticker = build_ticker(symbol, exchange)
-    hist   = yf.Ticker(ticker).history(period="2d")
+    hist = fetch_history(ticker, "5d", "1d")
     if hist.empty and exchange.upper() == "BSE":
-        hist = yf.Ticker(f"{symbol.upper()}.NS").history(period="2d")
+        hist = fetch_history(f"{symbol.upper()}.NS", "5d", "1d")
+    if not hist.empty:
+        return float(hist["Close"].iloc[-1])
+
+    ticker_obj = yf.Ticker(ticker)
+    try:
+        fast_price = ticker_obj.fast_info.get("last_price")
+        if fast_price:
+            return float(fast_price)
+    except Exception:
+        pass
+
+    hist = ticker_obj.history(period="2d", interval="1m")
+    if hist.empty:
+        hist = ticker_obj.history(period="2d")
+    if hist.empty and exchange.upper() == "BSE":
+        fallback_obj = yf.Ticker(f"{symbol.upper()}.NS")
+        hist = fallback_obj.history(period="2d", interval="1m")
+        if hist.empty:
+            hist = fallback_obj.history(period="2d")
     if hist.empty:
         raise HTTPException(status_code=404, detail=f"No data for {ticker}")
     return float(hist["Close"].iloc[-1])
@@ -333,15 +413,15 @@ def get_price(exchange: str, symbol: str):
 def get_chart(
     exchange: str,
     symbol:   str,
-    interval: str = "1d",   # 1m | 5m | 10m | 1h | 1d | 1mo | 3mo 
-    period:   str = "6mo",  # legacy fallback for daily
+    interval: str = "1d",    # 1m | 5m | 10m | 1h | 1d | 1mo | 3mo
+    period:   str = "100d",  # capped at 100d; intraday capped lower
 ):
     ticker_str   = build_ticker(symbol, exchange)
     resample_10m = False
     yf_interval  = interval
 
     VALID_INTERVALS = {
-    "1m", "2m", "5m", "15m", "30m",
+    "1m", "2m", "5m", "10m", "15m", "30m",
     "60m", "90m", "1h", "4h",
     "1d", "5d", "1wk", "1mo", "3mo"
     }
@@ -356,14 +436,17 @@ def get_chart(
         yf_interval  = "5m"   # fetch 5m, resample to 10m
         resample_10m = True
 
-    fetch_period = "7d" if interval in INTRADAY else INTERVAL_PERIOD_MAP.get(interval, period)
+    fetch_period = normalize_chart_period(
+        period if interval not in INTERVAL_PERIOD_MAP else period or INTERVAL_PERIOD_MAP[interval],
+        interval in INTRADAY,
+    )
 
-    hist = yf.Ticker(ticker_str).history(period=fetch_period, interval=yf_interval)
+    hist = fetch_history(ticker_str, fetch_period, yf_interval)
 
     # BSE fallback
     if hist.empty and exchange.upper() == "BSE":
         ticker_str = f"{symbol.upper()}.NS"
-        hist       = yf.Ticker(ticker_str).history(period=fetch_period, interval=yf_interval)
+        hist       = fetch_history(ticker_str, fetch_period, yf_interval)
 
     if hist.empty:
         raise HTTPException(status_code=404, detail=f"No data for {ticker_str}")
