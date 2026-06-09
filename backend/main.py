@@ -11,12 +11,13 @@ import os
 import requests
 from datetime import datetime
 from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="TradeSim API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://trade-sim-tau.vercel.app",],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
